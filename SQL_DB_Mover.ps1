@@ -4,7 +4,7 @@
 .DESCRIPTION
     Windows Forms интерфейс: выбор баз, указание нового пути, генерация SQL,
     опциональное физическое перемещение файлов через Move-Item (OFFLINE -> move -> MODIFY FILE -> ONLINE).
-    Системные БД (master, model, msdb, tempdb) исключены.
+    Системные БД (master, model, msdb, tempdb) исключены. Поддерживает базы в OFFLINE.
 #>
 
 #region Загрузка сборок
@@ -25,40 +25,50 @@ function Get-SqlServerConnection {
     return New-Object Microsoft.SqlServer.Management.Smo.Server($conn)
 }
 
-function Get-UserDatabases {
+function Get-DatabaseList {
     param($Server)
-    $systemDbs = @('master', 'model', 'msdb', 'tempdb')
-    $Server.Databases | Where-Object { $systemDbs -notcontains $_.Name } | Sort-Object Name
-}
+    # Читаем всё напрямую из master, не трогая сами базы
+    $query = @"
+    SELECT
+        d.name AS DatabaseName,
+        d.state_desc AS StateDesc,
+        CONVERT(NVARCHAR(MAX), ep.value) AS Purpose,
+        mf.name AS LogicalName,
+        mf.physical_name AS PhysicalName,
+        mf.type_desc AS FileType,
+        CAST(mf.size / 128.0 AS DECIMAL(10,2)) AS SizeMB
+    FROM sys.databases d
+    LEFT JOIN sys.master_files mf ON d.database_id = mf.database_id
+    LEFT JOIN sys.extended_properties ep ON ep.major_id = d.database_id AND ep.minor_id = 0 AND ep.name = 'Description' AND ep.class = 0
+    WHERE d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+    ORDER BY d.name, mf.file_id
+"@
+    $rows = $Server.ConnectionContext.ExecuteWithResults($query).Tables[0].Rows
 
-function Get-DatabaseFiles {
-    param($Database)
-    $files = @()
-    foreach ($fg in $Database.FileGroups) {
-        foreach ($file in $fg.Files) {
-            $files += [PSCustomObject]@{
-                LogicalName = $file.Name; PhysicalName = $file.FileName
-                Type = 'ROWS'; SizeMB = [math]::Round($file.Size / 1024, 2)
+    $dbs = @{}
+    foreach ($row in $rows) {
+        $dbName = $row.DatabaseName
+        if (-not $dbs.ContainsKey($dbName)) {
+            $purpose = ""
+            if ($row.Purpose -ne [System.DBNull]) { $purpose = $row.Purpose.ToString() }
+
+            $dbs[$dbName] = [PSCustomObject]@{
+                Name    = $dbName
+                Status  = $row.StateDesc
+                Purpose = $purpose
+                Files   = @()
+            }
+        }
+        if ($row.LogicalName -ne [System.DBNull]) {
+            $dbs[$dbName].Files += [PSCustomObject]@{
+                LogicalName  = $row.LogicalName
+                PhysicalName = $row.PhysicalName
+                Type         = $row.FileType
+                SizeMB       = $row.SizeMB
             }
         }
     }
-    foreach ($logFile in $Database.LogFiles) {
-        $files += [PSCustomObject]@{
-            LogicalName = $logFile.Name; PhysicalName = $logFile.FileName
-            Type = 'LOG'; SizeMB = [math]::Round($logFile.Size / 1024, 2)
-        }
-    }
-    return $files
-}
-
-function Get-CurrentDirectories {
-    param($Database)
-    $dirs = @()
-    foreach ($f in (Get-DatabaseFiles -Database $Database)) {
-        $dir = Split-Path $f.PhysicalName -Parent
-        if ($dir -and ($dirs -notcontains $dir)) { $dirs += $dir }
-    }
-    return $dirs
+    return $dbs.Values | Sort-Object Name
 }
 
 function Generate-MoveScript {
@@ -257,27 +267,31 @@ $btnConnect.Add_Click({
             -UseWindowsAuth:$chkWindowsAuth.Checked `
             -UserName $txtUser.Text -Password $txtPass.Text
         $global:SqlServer = $server
-        $dbs = Get-UserDatabases -Server $server
+        
+        # Получаем данные напрямую
+        $global:DbData = Get-DatabaseList -Server $server
+        
         $dgv.Rows.Clear()
-        foreach ($db in $dbs) {
-            $purpose = ""
-            $descProp = $db.ExtendedProperties | Where-Object { $_.Name -eq 'Description' }
-            if ($descProp) { $purpose = $descProp.Value }
+        foreach ($db in $global:DbData) {
+            $dirs = @()
+            foreach ($f in $db.Files) {
+                $dir = Split-Path $f.PhysicalName -Parent
+                if ($dir -and ($dirs -notcontains $dir)) { $dirs += $dir }
+            }
+            $currentPathText = ($dirs -join "; ")
 
-            $files = Get-DatabaseFiles -Database $db
-            $dirs = Get-CurrentDirectories -Database $db
-            $tooltipLines = @("База данных: $($db.Name)", "Файлов: $($files.Count)", "")
-            foreach ($f in $files) {
+            $tooltipLines = @("База данных: $($db.Name)", "Файлов: $($db.Files.Count)", "")
+            foreach ($f in $db.Files) {
                 $tooltipLines += "[$($f.Type)] $($f.LogicalName) ($($f.SizeMB) MB)"
                 $tooltipLines += "    $($f.PhysicalName)"
             }
             $tooltip = $tooltipLines -join "`r`n"
 
-            $ri = $dgv.Rows.Add($false, $db.Name, $files.Count, ($dirs -join "; "), $purpose, $db.Status)
+            $ri = $dgv.Rows.Add($false, $db.Name, $db.Files.Count, $currentPathText, $db.Purpose, $db.Status)
             $dgv.Rows[$ri].Cells["CurrentPath"].ToolTipText = $tooltip
             $dgv.Rows[$ri].Cells["Name"].ToolTipText = $tooltip
         }
-        [System.Windows.Forms.MessageBox]::Show("Подключено. Баз: $($dbs.Count)", "Успех", "OK", "Information")
+        [System.Windows.Forms.MessageBox]::Show("Подключено. Баз: $($global:DbData.Count)", "Успех", "OK", "Information")
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Ошибка подключения:`n$($_.Exception.Message)", "Ошибка", "OK", "Error")
     }
@@ -307,15 +321,17 @@ $btnGenerate.Add_Click({
         [System.Windows.Forms.MessageBox]::Show("Укажите новый путь.", "Внимание", "OK", "Warning"); return
     }
 
-    # Сохраняем «план переноса» — чтобы при выполнении не парсить текст, а знать точно
+    # Сохраняем «план переноса»
     $global:MovePlan = @()
     $allScripts = @()
+    
     foreach ($dbName in $selectedDbs) {
-        $db = $global:SqlServer.Databases[$dbName]
+        # Берем данные из нашего кэша, который мы загрузили при подключении
+        $db = $global:DbData | Where-Object { $_.Name -eq $dbName }
         if (-not $db) { continue }
-        $files = Get-DatabaseFiles -Database $db
+
         $filePlan = @()
-        foreach ($f in $files) {
+        foreach ($f in $db.Files) {
             $filePlan += [PSCustomObject]@{
                 LogicalName = $f.LogicalName
                 OldPath     = $f.PhysicalName
@@ -323,13 +339,18 @@ $btnGenerate.Add_Click({
                 Type        = $f.Type
             }
         }
+        
         $global:MovePlan += [PSCustomObject]@{
             Database = $dbName
+            Status   = $db.Status
             NewPath  = $newPath
             Files    = $filePlan
         }
-        $allScripts += Generate-MoveScript -DatabaseName $dbName -NewPath $newPath -Files $files
+        
+        # Передаем в генератор массив файлов из кэша
+        $allScripts += Generate-MoveScript -DatabaseName $dbName -NewPath $newPath -Files $db.Files
     }
+    
     $txtScripts.Text = $allScripts -join "`r`n`r`n"
     $btnExecute.Enabled = $true
     [System.Windows.Forms.MessageBox]::Show("Скрипты сгенерированы. Проверьте их в поле ниже.", "Готово", "OK", "Information")
@@ -343,10 +364,10 @@ $btnExecute.Add_Click({
     $doPhysical = $chkPhysicalMove.Checked
     $msg = if ($doPhysical) {
         "Будет выполнено:`n" +
-        "1. OFFLINE баз (с откатом транзакций)`n" +
-        "2. ФИЗИЧЕСКОЕ перемещение файлов через Move-Item`n" +
+        "1. Перевод в OFFLINE (если база была ONLINE)`n" +
+        "2. ФИЗИЧЕСКОЕ перемещение файлов`n" +
         "3. MODIFY FILE (новые пути)`n" +
-        "4. ONLINE`n`nПродолжить?"
+        "4. Возврат в ONLINE (если база была ONLINE)`n`nПродолжить?"
     } else {
         "Будет выполнена только замена путей в метаданных (ALTER DATABASE MODIFY FILE).`n" +
         "Файлы физически НЕ перемещаются.`n`nПродолжить?"
@@ -359,13 +380,24 @@ $btnExecute.Add_Click({
     try {
         foreach ($plan in $global:MovePlan) {
             $dbName = $plan.Database
-            [void]$log.AppendLine(">>> База: $dbName")
+            [void]$log.AppendLine(">>> База: $dbName (Состояние: $($plan.Status))")
+            $txtScripts.Text = $log.ToString()
+            [System.Windows.Forms.Application]::DoEvents() # Чтобы окно не зависало
 
             if ($doPhysical) {
-                # 1) OFFLINE — освобождает файловые дескрипторы
-                [void]$log.AppendLine("    SET OFFLINE ...")
-                $global:SqlServer.ConnectionContext.ExecuteNonQuery(
-                    "USE master; ALTER DATABASE [$dbName] SET OFFLINE WITH ROLLBACK IMMEDIATE;")
+                $wasSetOffline = $false
+                
+                # 1) OFFLINE — только если база сейчас ONLINE
+                if ($plan.Status -eq 'ONLINE') {
+                    [void]$log.AppendLine("    SET OFFLINE ...")
+                    $txtScripts.Text = $log.ToString()
+                    [System.Windows.Forms.Application]::DoEvents()
+                    $global:SqlServer.ConnectionContext.ExecuteNonQuery(
+                        "USE master; ALTER DATABASE [$dbName] SET OFFLINE WITH ROLLBACK IMMEDIATE;")
+                    $wasSetOffline = $true
+                } else {
+                    [void]$log.AppendLine("    [INFO] База уже в состоянии $($plan.Status). Шаг SET OFFLINE пропущен.")
+                }
 
                 try {
                     # 2) Физическое перемещение
@@ -385,12 +417,22 @@ $btnExecute.Add_Click({
                         if (Test-Path -LiteralPath $f.NewPath) {
                             throw "Целевой файл уже существует: $($f.NewPath)"
                         }
+                        
+                        [void]$log.AppendLine("    [move] Начинаю перенос $($f.LogicalName)...")
+                        $txtScripts.Text = $log.ToString()
+                        [System.Windows.Forms.Application]::DoEvents()
+                        
                         Move-Item -LiteralPath $f.OldPath -Destination $f.NewPath -Force -ErrorAction Stop
                         [void]$log.AppendLine("    [move] $($f.OldPath) -> $($f.NewPath)")
+                        $txtScripts.Text = $log.ToString()
+                        [System.Windows.Forms.Application]::DoEvents()
                     }
 
                     # 3) Обновление метаданных
                     [void]$log.AppendLine("    MODIFY FILE ...")
+                    $txtScripts.Text = $log.ToString()
+                    [System.Windows.Forms.Application]::DoEvents()
+                    
                     $sqlModify = "USE master;`r`n"
                     foreach ($f in $plan.Files) {
                         $sqlModify += "ALTER DATABASE [$dbName] MODIFY FILE (NAME = N'$($f.LogicalName)', FILENAME = N'$($f.NewPath)');`r`n"
@@ -398,23 +440,40 @@ $btnExecute.Add_Click({
                     $global:SqlServer.ConnectionContext.ExecuteNonQuery($sqlModify)
                 }
                 finally {
-                    # 4) ONLINE в любом случае
-                    [void]$log.AppendLine("    SET ONLINE ...")
-                    try {
-                        $global:SqlServer.ConnectionContext.ExecuteNonQuery(
-                            "USE master; ALTER DATABASE [$dbName] SET ONLINE;")
-                    } catch {
-                        [void]$log.AppendLine("    [WARN] ONLINE: $($_.Exception.Message)")
+                    # 4) ONLINE — только если мы сами её туда переводили
+                    if ($wasSetOffline) {
+                        [void]$log.AppendLine("    SET ONLINE ...")
+                        $txtScripts.Text = $log.ToString()
+                        [System.Windows.Forms.Application]::DoEvents()
+                        try {
+                            $global:SqlServer.ConnectionContext.ExecuteNonQuery(
+                                "USE master; ALTER DATABASE [$dbName] SET ONLINE;")
+                        } catch {
+                            [void]$log.AppendLine("    [WARN] ONLINE: $($_.Exception.Message)")
+                        }
+                    } else {
+                        [void]$log.AppendLine("    [INFO] Шаг SET ONLINE пропущен (база остается в состоянии $($plan.Status)).")
                     }
                 }
             }
             else {
-                # Только метаданные (как раньше)
-                $sqlOnly = "USE master;`r`nALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;`r`n"
+                # Только метаданные (без физического переноса)
+                $sqlOnly = "USE master;`r`n"
+                
+                # Применяем SINGLE_USER только если база онлайн
+                if ($plan.Status -eq 'ONLINE') {
+                    $sqlOnly += "ALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;`r`n"
+                }
+
                 foreach ($f in $plan.Files) {
                     $sqlOnly += "ALTER DATABASE [$dbName] MODIFY FILE (NAME = N'$($f.LogicalName)', FILENAME = N'$($f.NewPath)');`r`n"
                 }
-                $sqlOnly += "ALTER DATABASE [$dbName] SET MULTI_USER;`r`n"
+
+                # Возвращаем MULTI_USER только если база была онлайн
+                if ($plan.Status -eq 'ONLINE') {
+                    $sqlOnly += "ALTER DATABASE [$dbName] SET MULTI_USER;`r`n"
+                }
+
                 $global:SqlServer.ConnectionContext.ExecuteNonQuery($sqlOnly)
                 [void]$log.AppendLine("    MODIFY FILE выполнен (без физического переноса)")
             }
@@ -422,7 +481,7 @@ $btnExecute.Add_Click({
         }
         [void]$log.AppendLine("=== Успешно завершено ===")
         $txtScripts.Text = $log.ToString()
-        [System.Windows.Forms.MessageBox]::Show("Готово. Смотрите лог в окне скриптов.", "Успех", "OK", "Information")
+        [System.Windows.Forms.MessageBox]::Show("Готово. Смотрите лог.", "Успех", "OK", "Information")
         $btnExecute.Enabled = $false
     } catch {
         [void]$log.AppendLine("!!! ОШИБКА: $($_.Exception.Message)")
